@@ -16,6 +16,8 @@ import (
     "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
     "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armsubscriptions"
     "github.com/microsoftgraph/msgraph-sdk-go"
+    graphmodels "github.com/microsoftgraph/msgraph-sdk-go/models"
+    "github.com/microsoftgraph/msgraph-sdk-go/models/odataerrors"
 )
 
 func bootstrap() {
@@ -40,10 +42,6 @@ func bootstrap() {
         fmt.Scanln(&redirectUrl)
     }
 
-    // inform the user that we'll be authenticating, and they should press enter to continue
-    log.Println("Press enter to authenticate")
-    fmt.Scanln()
-
     // Create a new InteractiveBrowserCredentialOptions
     options := &azidentity.InteractiveBrowserCredentialOptions{
         TenantID:    tenantID,
@@ -59,22 +57,77 @@ func bootstrap() {
 
     var ctx = context.Background()
 
-    graphClient, err := msgraphsdkgo.NewGraphServiceClientWithCredentials(cred, []string{"Files.Read"})
+    graphClient, err := msgraphsdkgo.NewGraphServiceClientWithCredentials(cred, []string{"Application.ReadWrite.All"})
     if err != nil {
-        fmt.Printf("Error creating client: %v\n", err)
+        handle(err)
         return
     }
     result, err := graphClient.Me().Get(ctx, nil)
     if err != nil {
-        fmt.Printf("Error getting user: %v\n", err)
+        handle(err)
         return
     }
+
+    // check if there's an application with the same name already registered
+    appName := "Deployment"
+    apps, err := graphClient.Applications().Get(ctx, nil)
+    if err != nil {
+        handle(err)
+        return
+    }
+
+    var app *graphmodels.Application
+    for _, item := range apps.GetValue() {
+        if *item.GetDisplayName() == appName {
+            app = item.(*graphmodels.Application)
+            break
+        }
+    }
+
+    if app == nil {
+        // register a deployment application using the Graph Client
+        app, err = createApplication(graphClient, appName)
+        if err != nil {
+            handle(err)
+            return
+        }
+    } else {
+        log.Println("Application already exists")
+    }
+
+    var sp *graphmodels.ServicePrincipal
+    sps, err := graphClient.ServicePrincipals().Get(ctx, nil)
+    if err != nil {
+        handle(err)
+        return
+    }
+
+    for _, item := range sps.GetValue() {
+        if *item.GetAppId() == *app.GetAppId() {
+            sp = item.(*graphmodels.ServicePrincipal)
+            break
+        }
+    }
+
+    if sp == nil {
+        sp, err = createServicePrincipal(graphClient, app)
+        if err != nil {
+            handle(err)
+            return
+        }
+    } else {
+        log.Println("Service principal already exists")
+    }
+
+    fmt.Println("Service Principal: ", *sp.GetId())
+    fmt.Println("Application Id: ", *app.GetId())
 
     objectID := *result.GetId()
 
     subscription, err := selectSubscription(ctx, cred)
     if err != nil {
-        log.Fatalln(err)
+        handle(err)
+        return
     }
     log.Printf("Using subscription %s (%s)", subscription.DisplayName, subscription.SubscriptionID)
 
@@ -83,7 +136,8 @@ func bootstrap() {
 
     suffix, err := suffix(resourceGroupName, location, subscription.SubscriptionID)
     if err != nil {
-        log.Fatalln(err)
+        handle(err)
+        return
     }
 
     prefix := strings.ToLower(resourceGroupName)
@@ -93,16 +147,61 @@ func bootstrap() {
     vaultName := prefix + "-" + suffix
     err = createResourceGroup(subscription, cred, ctx, resourceGroupName, location)
     if err != nil {
-        log.Fatalln(err)
+        handle(err)
+        return
     }
     log.Printf("Created resource group '%s'", resourceGroupName)
 
-    objectIDs := []string{objectID}
+    objectIDs := []string{objectID, *sp.GetId()}
     err = createKeyVault(ctx, cred, subscription, resourceGroupName, location, vaultName, objectIDs)
     if err != nil {
-        log.Fatalln(err)
+        handle(err)
+        return
     }
     log.Printf("Created key vault '%s' in resource group '%s'", vaultName, resourceGroupName)
+}
+
+func createServicePrincipal(
+    graphClient *msgraphsdkgo.GraphServiceClient,
+    app *graphmodels.Application,
+) (*graphmodels.ServicePrincipal, error) {
+    requestBody := graphmodels.NewServicePrincipal()
+    appId := *app.GetAppId()
+    requestBody.SetAppId(&appId)
+
+    spResult, err := graphClient.ServicePrincipals().Post(context.Background(), requestBody, nil)
+    if err != nil {
+        return nil, fmt.Errorf("error creating service principal: %w", err)
+    }
+    sp := spResult.(*graphmodels.ServicePrincipal)
+    return sp, nil
+}
+
+func createApplication(graphClient *msgraphsdkgo.GraphServiceClient, appName string) (*graphmodels.Application, error) {
+    requestBody := graphmodels.NewApplication()
+    displayName := appName
+    requestBody.SetDisplayName(&displayName)
+    appResult, err := graphClient.Applications().Post(context.Background(), requestBody, nil)
+    if err != nil {
+        return nil, fmt.Errorf("error creating application: %w", err)
+    }
+
+    app := appResult.(*graphmodels.Application)
+    return app, nil
+}
+
+func handle(err error) {
+    switch err.(type) {
+    case *odataerrors.ODataError:
+        typed := err.(*odataerrors.ODataError)
+        fmt.Printf("error:", typed.Error())
+        if terr := typed.GetError(); terr != nil {
+            fmt.Printf("code: %s", *terr.GetCode())
+            fmt.Printf("msg: %s", *terr.GetMessage())
+        }
+    default:
+        fmt.Printf("%T > error: %#v", err, err)
+    }
 }
 
 func suffix(parts ...string) (string, error) {
