@@ -18,7 +18,7 @@ jobs:
         run: go get .
 
       - name: Build
-        run: go build -v o bin/bootstrap
+        run: go build -v -o bin/bootstrap
 
       - name: Test
         run: go test
